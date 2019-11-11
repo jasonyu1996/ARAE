@@ -74,7 +74,8 @@ class Seq2Seq2Decoder(nn.Module):
         # Vocabulary embedding
         self.embedding = nn.Embedding(ntokens, emsize)
         self.embedding_decoder1 = nn.Embedding(ntokens, emsize)
-        self.embedding_decoder2 = nn.Embedding(ntokens, emsize)
+        #self.embedding_decoder2 = nn.Embedding(ntokens, emsize)
+        self.embedding_decoder2 = self.embedding_decoder1
 
         # RNN Encoder and Decoder
         self.encoder = nn.LSTM(input_size=emsize,
@@ -89,11 +90,14 @@ class Seq2Seq2Decoder(nn.Module):
                                num_layers=1,
                                dropout=dropout,
                                batch_first=True)
+        self.decoder2 = self.decoder1
+        '''
         self.decoder2 = nn.LSTM(input_size=decoder_input_size,
                                hidden_size=nhidden,
                                num_layers=1,
                                dropout=dropout,
                                batch_first=True)
+        '''
 
         # Initialize Linear Transformation
         self.linear = nn.Linear(nhidden, ntokens)
