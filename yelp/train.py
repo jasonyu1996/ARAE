@@ -256,15 +256,13 @@ if args.victim:
         tot_classify_loss = 0.0
         tot_classify_acc = 0.0
         while niter < len(test1_data) and niter < len(test2_data):
-            classify_loss1, classify_acc1 = play_with_classifier(1, train1_data[niter], train=False)
-            classify_loss2, classify_acc2 = play_with_classifier(2, train2_data[niter], train=False)
+            classify_loss1, classify_acc1 = play_with_classifier(1, test1_data[niter], train=False)
+            classify_loss2, classify_acc2 = play_with_classifier(2, test2_data[niter], train=False)
             classify_loss = (classify_loss1 + classify_loss2) / 2
             classify_acc = (classify_acc1 + classify_acc2) / 2
 
             tot_classify_loss += classify_loss
             tot_classify_acc += classify_acc
-
-            niter += 1
 
             niter += 1
 
@@ -298,7 +296,11 @@ if args.victim:
         with open('{}/victim{}.pt'.format(args.outf, epoch), 'wb') as f:
             torch.save(victim_classifier.state_dict(), f)
        
+        train1_data = batchify(corpus.data['train1'], args.batch_size, shuffle=True)
+        train2_data = batchify(corpus.data['train2'], args.batch_size, shuffle=True)
+        
 else:
+    
 ###############################################################################
 # Decomposition parameter setting 
 ###############################################################################
