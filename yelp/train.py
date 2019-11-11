@@ -111,10 +111,15 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', dest='cuda', action='store_true',
                     help='use CUDA')
-parser.add_argument('--no-cuda', dest='cuda', action='store_true',
-                    help='not using CUDA')
-parser.set_defaults(cuda=True)
+parser.add_argument('--no-cuda', dest='cuda', action='store_false',
+                    help='do not use CUDA')
 parser.add_argument('--device_id', type=str, default='0')
+
+parser.set_defaults(cuda=True)
+
+# For decomposition
+parser.add_argument('--relevant-ratio', type=float, default=0.5,
+                    help='ratio of the dim of relevant representations')
 
 args = parser.parse_args()
 print(vars(args))
@@ -182,6 +187,15 @@ train2_data = batchify(corpus.data['train2'], args.batch_size, shuffle=True)
 print("Loaded data!")
 
 ###############################################################################
+# Decomposition parameter setting 
+###############################################################################
+
+# dimension of relevant representation
+nhidden_rel = int(args.nhidden * args.relevant_ratio)
+# dimension of irrelevant representation
+nhidden_irr = args.nhidden - nhidden_rel
+
+###############################################################################
 # Build the models
 ###############################################################################
 
@@ -197,7 +211,7 @@ autoencoder = Seq2Seq2Decoder(emsize=args.emsize,
 
 gan_gen = MLP_G(ninput=args.z_size, noutput=args.nhidden, layers=args.arch_g)
 gan_disc = MLP_D(ninput=args.nhidden, noutput=1, layers=args.arch_d)
-classifier = MLP_Classify(ninput=args.nhidden, noutput=1, layers=args.arch_classify)
+classifier = MLP_Classify(ninput=nhidden_irr, noutput=1, layers=args.arch_classify)
 g_factor = None
 
 print(autoencoder)
@@ -251,11 +265,11 @@ def train_classifier(whichclass, batch):
 
     # Train
     code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
-    scores = classifier(code)
+    scores = classifier(code[:,:nhidden_irr])
     classify_loss = F.binary_cross_entropy(scores.squeeze(1), labels)
     classify_loss.backward()
     optimizer_classify.step()
-    classify_loss = classify_loss.cpu().data[0]
+    classify_loss = classify_loss.cpu().item()
 
     pred = scores.data.round().squeeze(1)
     accuracy = pred.eq(labels.data).float().mean()
@@ -280,7 +294,7 @@ def classifier_regularize(whichclass, batch):
     # Train
     code = autoencoder(0, source, lengths, noise=False, encode_only=True)
     code.register_hook(grad_hook_cla)
-    scores = classifier(code)
+    scores = classifier(code[:,:nhidden_irr])
     classify_reg_loss = F.binary_cross_entropy(scores.squeeze(1), labels)
     classify_reg_loss.backward()
 
@@ -318,7 +332,7 @@ def evaluate_autoencoder(whichdecoder, data_source, epoch):
             # accuracy
             max_vals1, max_indices1 = torch.max(masked_output, 1)
             all_accuracies += \
-                torch.mean(max_indices1.eq(masked_target).float()).data[0]
+                torch.mean(max_indices1.eq(masked_target).float()).item()
         
             max_values1, max_indices1 = torch.max(output, 2)
             max_indices2 = autoencoder.generate(2, hidden, maxlen=50)
@@ -330,7 +344,7 @@ def evaluate_autoencoder(whichdecoder, data_source, epoch):
             # accuracy
             max_vals2, max_indices2 = torch.max(masked_output, 1)
             all_accuracies += \
-                torch.mean(max_indices2.eq(masked_target).float()).data[0]
+                torch.mean(max_indices2.eq(masked_target).float()).item()
 
             max_values2, max_indices2 = torch.max(output, 2)
             max_indices1 = autoencoder.generate(1, hidden, maxlen=50)
