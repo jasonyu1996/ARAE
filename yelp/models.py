@@ -613,3 +613,26 @@ def generate(autoencoder, gan_gen, z, vocab, sample, maxlen):
         sentences.append(sent)
 
     return sentences
+
+
+# ==============================================
+# Victim model
+# ==============================================
+
+class EmbeddingClassifier(nn.Module):
+    def __init__(self, emb_size, vocab_size, out_size):
+        super(EmbeddingClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.linear = nn.Linear(emb_size, out_size)
+        #embeddings_mat = load_embeddings()
+        # TODO: check what this load_embeddings does
+        # self.embedding.weight.data.copy_(embeddings_mat)
+
+    def forward(self, batch):
+        emb = self.embedding(batch)
+        enc = torch.mean(emb,1).squeeze(1)
+
+        probs = F.sigmoid(self.linear(enc))
+        return probs
+
+
