@@ -131,6 +131,8 @@ parser.add_argument('--lr_surrogate', type=float, default=1e-04,
                     help='surrogate classifier learning rate')
 parser.add_argument('--budget', type=float, default=1e-3,
                     help='budget for generating the adversarial example')
+parser.add_argument('--surrogate-samples', type=int, default=0,
+                    help='number of noise generated samples surrogate is trained on for each batch')
 
 
 # For victim
@@ -212,6 +214,16 @@ train1_data = batchify(corpus.data['train1'], args.batch_size, shuffle=True)
 train2_data = batchify(corpus.data['train2'], args.batch_size, shuffle=True)
 
 print("Loaded data!")
+
+
+
+def clean_tokens(token_list):
+    out = []
+    for t in token_list:
+        if corpus.dictionary.idx2word[t] in ['<eos>', '<pad>']:
+            break
+        out.append(t)
+    return out
 
 if args.victim:
     victim_outf = args.outf + '/victim'
@@ -675,6 +687,10 @@ else:
         print('Loading models ...')
         with open('{}/autoencoder_model.pt'.format(args.outf), 'rb') as f:
             autoencoder.load_state_dict(torch.load(f))
+        with open('{}/gan_gen_model.pt'.format(args.outf), 'rb') as f:
+            gan_gen.load_state_dict(torch.load(f))
+        with open('{}/gan_disc_model.pt'.format(args.outf), 'rb') as f:
+            gan_disc.load_state_dict(torch.load(f))
 # load the victim
         with open('{}/victim/{}.pt'.format(args.outf, args.victim_load), 'rb') as f:
             victim_classifier.load_state_dict(torch.load(f))
@@ -684,7 +700,7 @@ else:
             surrogate_optimizer = optim.Adam(surrogate.parameters(),
                     lr=args.lr_surrogate,
                     betas=(args.beta1, 0.999))
-            def play_with_surrogate(batch, train=True):
+            def play_with_surrogate(batch, code=None, train=True):
                 victim_classifier.eval()
                 if train:
                     surrogate.train()
@@ -696,7 +712,8 @@ else:
                 source = to_gpu(args.cuda, Variable(source))
 
                 out_gold = victim_classifier(source).detach()
-                code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
+                if code is None:
+                    code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
 # (nbatch, nhidden)
                 out_surrogate = surrogate(code)
                 
@@ -726,16 +743,47 @@ else:
             for epoch in range(1, args.epochs + 1):
                 niter = 0
                 tot_loss = 0.0
+                tot_sample_loss = 0.0
                 while niter < len(train1_data) and niter < len(train2_data):
                     loss1 = play_with_surrogate(train1_data[niter])
                     loss2 = play_with_surrogate(train2_data[niter])
                     loss = (loss1 + loss2) / 2
 
+                    
+                    if args.surrogate_samples != 0:
+                        fixed_noise = to_gpu(args.cuda,
+                             Variable(torch.ones(args.surrogate_samples, args.z_size)))
+                        fixed_noise.normal_(0, 1)
+
+                        gan_gen.eval()
+
+                        sample_hidden = gan_gen(fixed_noise)
+                        max_indices = autoencoder.generate(1, sample_hidden, 50).cpu().numpy()
+                        max_indices = [clean_tokens([corpus.dictionary.word2idx['<bos>']] \
+                                + list(sent_idx)) for sent_idx in max_indices]
+                        lens = list(map(len, max_indices))
+                        mx_len = max(lens)
+                        for sent_idx in max_indices:
+                            for i in range(len(sent_idx), mx_len):
+                                sent_idx.append(corpus.dictionary.word2idx['<pad>'])
+                        max_indices = torch.tensor(max_indices, dtype=torch.int64)
+                        lens = torch.tensor(lens, dtype=torch.int64)
+                        sample_loss = play_with_surrogate((max_indices, None, lens), code=sample_hidden)
+                        
+                        tot_sample_loss += sample_loss
+                         
+
                     tot_loss += loss
                     niter += 1
                     if niter % 100 == 0:
-                        print('* Iter %d, loss %.5f' % (niter, tot_loss / 100))
+                        if args.surrogate_samples == 0:
+                            print('* Iter %d, loss %.5f' % (niter, tot_loss / 100))
+                        else:
+                            print('* Iter %d, loss %.5f, sample loss %.5f' % (niter, tot_loss / 100, \
+                                    tot_sample_loss / 100))
+
                         tot_loss = 0.0
+                        tot_sample_loss = 0.0
 
                 test_loss = evaluate_surrogate()
                 print('Epoch %d: %.5f' % (epoch, test_loss))
@@ -774,14 +822,6 @@ else:
                 perturbed_code = torch.cat((irrelevant + irrelevant.grad * args.budget, relevant), 1)
                 
                 return autoencoder.generate(whichclass, perturbed_code, 50).squeeze(0)
-
-            def clean_tokens(token_list):
-                out = []
-                for t in token_list:
-                    if corpus.dictionary.idx2word[t] in ['<eos>', '<pad>']:
-                        break
-                    out.append(t)
-                return out
 
             with open('{}/surrogate/{}.pt'.format(args.outf, args.surrogate_load), 'rb') as f:
                 surrogate.load_state_dict(torch.load(f))
