@@ -129,6 +129,8 @@ parser.add_argument('--surrogate-perturb', action='store_true',
                     help='load existing surrogate classifier to find perturbations')
 parser.add_argument('--lr_surrogate', type=float, default=1e-04,
                     help='surrogate classifier learning rate')
+parser.add_argument('--budget', type=float, default=1e-3,
+                    help='budget for generating the adversarial example')
 
 
 # For victim
@@ -664,6 +666,11 @@ else:
     if args.surrogate or args.surrogate_perturb:
         surrogate = MLP_Classify(args.nhidden, 1, '512-256-128', gpu=args.cuda) 
         victim_classifier = EmbeddingClassifier(args.emsize, ntokens, 1)
+
+        if args.cuda:
+            surrogate = surrogate.cuda()
+            victim_classifier = victim_classifier.cuda()
+
 # load the autoencoder
         print('Loading models ...')
         with open('{}/autoencoder_model.pt'.format(args.outf), 'rb') as f:
@@ -714,7 +721,7 @@ else:
                     niter += 1
                 return tot_loss / cnt
 
-            os.makedirs('{}/surrogate', exist_ok=True)
+            os.makedirs('{}/surrogate'.format(args.outf), exist_ok=True)
 
             for epoch in range(1, args.epochs + 1):
                 niter = 0
@@ -737,14 +744,13 @@ else:
                 train2_data = batchify(corpus.data['train2'], args.batch_size, shuffle=True)
 
                 with open('{}/surrogate/surrogate{}.pt'.format(args.outf, epoch), 'wb') as fout:
-                    torch.save(surrogate.state_dict(), f)
+                    torch.save(surrogate.state_dict(), fout)
                 
         else:
 # perturb with trained surrogate classifier
             def perturb(whichclass, source, target, length):
                 source = source.unsqueeze(0)
                 target = target.unsqueeze(0)
-                length = length.unsqueeze(0)
 
                 source = to_gpu(args.cuda, Variable(source))
 
@@ -753,14 +759,14 @@ else:
                 surrogate.zero_grad()
                 victim_classifier.eval()
 
-                code = autoencoder(0, source, length, noise=False, encode_only=True).detach()
+                code = autoencoder(0, source, [length], noise=False, encode_only=True).detach()
                 irrelevant = code[:,:nhidden_irr]
                 relevant = code[:,nhidden_irr:]
                 
                 irrelevant.requires_grad = True
                 
                 labels = to_gpu(args.cuda, Variable(torch.zeros(source.size(0)).fill_(whichclass-1)))
-                out = surrogate(code)
+                out = surrogate(torch.cat((irrelevant, relevant), 1))
                 loss = F.binary_cross_entropy(out, labels)
 
                 loss.backward()
@@ -769,20 +775,30 @@ else:
                 
                 return autoencoder.generate(whichclass, perturbed_code, 50).squeeze(0)
 
+            def clean_tokens(token_list):
+                out = []
+                for t in token_list:
+                    if corpus.dictionary.idx2word[t] in ['<eos>', '<pad>']:
+                        break
+                    out.append(t)
+                return out
 
             with open('{}/surrogate/{}.pt'.format(args.outf, args.surrogate_load), 'rb') as f:
                 surrogate.load_state_dict(torch.load(f))
 
-            for label, data in [(1, test1_data), (2, test2_data)]:
+            for label, data in [(0, test1_data), (1, test2_data)]:
                 for batch in data:
                     source, target, length = batch
                     for isource, itarget, ilength in zip(source, target, length):
                         adversarial_idx = perturb(label, isource, itarget, ilength)
-                        chars_original = " ".join([corpus.dictionary.idx2word[x] for x in isource])
-                        chars = " ".join([corpus.dictionary.idx2word[x] for x in adversarial_idx])
 
-                        old_prediction = victim_classifier(isource.unsqueeze(0)).squeeze(0)
-                        new_prediction = victim_classifier(adversarial_idx.unsqueeze(0)).squeeze(0)
+                        clean_original = clean_tokens(list(isource.cpu().numpy()))
+                        clean_perturbed = clean_tokens([corpus.dictionary.word2idx['<bos>']] + list(adversarial_idx.cpu().numpy()))
+                        chars_original = " ".join([corpus.dictionary.idx2word[x] for x in clean_original])
+                        chars = " ".join([corpus.dictionary.idx2word[x] for x in clean_perturbed])
+
+                        old_prediction = victim_classifier(to_gpu(args.cuda, Variable(torch.tensor([clean_original], dtype=torch.int64)))).squeeze(0)
+                        new_prediction = victim_classifier(to_gpu(args.cuda, Variable(torch.tensor([clean_perturbed], dtype=torch.int64)))).squeeze(0)
 
                         print('======================')
                         print('Gold: ', label)
