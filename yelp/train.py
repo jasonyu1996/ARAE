@@ -133,6 +133,12 @@ parser.add_argument('--budget', type=float, default=1e-3,
                     help='budget for generating the adversarial example')
 parser.add_argument('--surrogate-samples', type=int, default=0,
                     help='number of noise generated samples surrogate is trained on for each batch')
+parser.add_argument('--surrogate-layers', type=str, default='512-256-128',
+                    help='layer dimensions of the surrogate classifier')
+parser.add_argument('--surrogate-disc-w', type=float, default=None,
+                    help='weight of the discriminator loss in surrogate perturbation')
+parser.add_argument('--random-perturb', action='store_true',
+                    help='randomly add perturbations')
 
 
 # For victim
@@ -377,13 +383,13 @@ else:
 # Training code
 ###############################################################################
 
-    def save_model():
+    def save_model(suffix=''):
         print("Saving models")
-        with open('{}/autoencoder_model.pt'.format(args.outf), 'wb') as f:
+        with open('{}/autoencoder_model{}.pt'.format(args.outf, suffix), 'wb') as f:
             torch.save(autoencoder.state_dict(), f)
-        with open('{}/gan_gen_model.pt'.format(args.outf), 'wb') as f:
+        with open('{}/gan_gen_model{}.pt'.format(args.outf, suffix), 'wb') as f:
             torch.save(gan_gen.state_dict(), f)
-        with open('{}/gan_disc_model.pt'.format(args.outf), 'wb') as f:
+        with open('{}/gan_disc_model{}.pt'.format(args.outf, suffix), 'wb') as f:
             torch.save(gan_disc.state_dict(), f)
 
 
@@ -676,7 +682,7 @@ else:
 
 
     if args.surrogate or args.surrogate_perturb:
-        surrogate = MLP_Classify(args.nhidden, 1, '512-256-128', gpu=args.cuda) 
+        surrogate = MLP_Classify(args.nhidden, 1, args.surrogate_layers, gpu=args.cuda) 
         victim_classifier = EmbeddingClassifier(args.emsize, ntokens, 1)
 
         if args.cuda:
@@ -806,25 +812,36 @@ else:
                 surrogate.eval()
                 surrogate.zero_grad()
                 victim_classifier.eval()
+                gan_disc.eval()
+                gan_disc.zero_grad()
 
                 code = autoencoder(0, source, [length], noise=False, encode_only=True).detach()
                 irrelevant = code[:,:nhidden_irr]
                 relevant = code[:,nhidden_irr:]
                 
-                irrelevant.requires_grad = True
-                
-                labels = to_gpu(args.cuda, Variable(torch.zeros(source.size(0)).fill_(whichclass-1)))
-                out = surrogate(torch.cat((irrelevant, relevant), 1))
-                loss = F.binary_cross_entropy(out, labels)
+                if args.random_perturb:
+                    perturbed_code = torch.cat((irrelevant + torch.sign(torch.randn_like(irrelevant)) * args.budget, relevant), 1)
+                else:
+                    irrelevant.requires_grad = True
+                    
+                    labels = to_gpu(args.cuda, Variable(torch.zeros(source.size(0)).fill_(whichclass-1)))
+                    code = torch.cat((irrelevant, relevant), 1)
+                    out = surrogate(code)
+                    loss = F.binary_cross_entropy(out, labels)
+                    if args.surrogate_disc_w is not None:
+                        loss = loss + args.surrogate_disc_w * gan_disc(code)
 
-                loss.backward()
+                    loss.backward()
                 
-                perturbed_code = torch.cat((irrelevant + irrelevant.grad * args.budget, relevant), 1)
+                    perturbed_code = torch.cat((irrelevant + torch.sign(irrelevant.grad) * args.budget, relevant), 1)
                 
                 return autoencoder.generate(whichclass, perturbed_code, 50).squeeze(0)
 
             with open('{}/surrogate/{}.pt'.format(args.outf, args.surrogate_load), 'rb') as f:
                 surrogate.load_state_dict(torch.load(f))
+
+            success = 0
+            tot_cnt = 0
 
             for label, data in [(0, test1_data), (1, test2_data)]:
                 for batch in data:
@@ -840,11 +857,17 @@ else:
                         old_prediction = victim_classifier(to_gpu(args.cuda, Variable(torch.tensor([clean_original], dtype=torch.int64)))).squeeze(0)
                         new_prediction = victim_classifier(to_gpu(args.cuda, Variable(torch.tensor([clean_perturbed], dtype=torch.int64)))).squeeze(0)
 
+                        if old_prediction.round().item() == label:
+                            tot_cnt += 1
+                            if new_prediction.round().item() != label:
+                                success += 1
+
                         print('======================')
                         print('Gold: ', label)
                         print('Original  (%.5f): ' % old_prediction, chars_original)
                         print('Perturbed (%.5f): ' % new_prediction, chars)
                         print('======================')
+            print('Success rate: %.5f%% (%d/%d)' % (success / tot_cnt * 100, success, tot_cnt))
                 
     else:
         print("Training...")
@@ -996,7 +1019,7 @@ else:
             train1_data = batchify(corpus.data['train1'], args.batch_size, shuffle=True)
             train2_data = batchify(corpus.data['train2'], args.batch_size, shuffle=True)
             
-        save_model()
+            save_model(epoch)
             
         test_loss, accuracy = evaluate_autoencoder(1, test1_data, epoch+1)
         print('-' * 89)
