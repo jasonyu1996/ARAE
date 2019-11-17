@@ -39,9 +39,9 @@ parser.add_argument('--no-lowercase', dest='lowercase', action='store_true',
 parser.set_defaults(lowercase=True)
 
 # Model Arguments
-parser.add_argument('--emsize', type=int, default=128,
+parser.add_argument('--emsize', type=int, default=256,
                     help='size of word embeddings')
-parser.add_argument('--nhidden', type=int, default=128,
+parser.add_argument('--nhidden', type=int, default=512,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=1,
                     help='number of layers' )
@@ -52,11 +52,11 @@ parser.add_argument('--noise_anneal', type=float, default=0.9995,
                          'every 100 iterations')
 parser.add_argument('--hidden_init', action='store_true',
                     help="initialize decoder hidden state with encoder's")
-parser.add_argument('--arch_g', type=str, default='128-128',
+parser.add_argument('--arch_g', type=str, default='512-512',
                     help='generator architecture (MLP)')
-parser.add_argument('--arch_d', type=str, default='128-128',
+parser.add_argument('--arch_d', type=str, default='512-512',
                     help='critic/discriminator architecture (MLP)')
-parser.add_argument('--arch_classify', type=str, default='128-128',
+parser.add_argument('--arch_classify', type=str, default='512-512',
                     help='classifier architecture')
 parser.add_argument('--z_size', type=int, default=32,
                     help='dimension of random noise z to feed into generator')
@@ -114,12 +114,16 @@ parser.add_argument('--cuda', dest='cuda', action='store_true',
 parser.add_argument('--no-cuda', dest='cuda', action='store_false',
                     help='do not use CUDA')
 parser.add_argument('--device_id', type=str, default='0')
+parser.add_argument('--load-suffix', type=str, default='1',
+                    help='suffix of model files to be loaded')
 
 parser.set_defaults(cuda=True)
 
 # For decomposition
 parser.add_argument('--relevant-ratio', type=float, default=0.5,
                     help='ratio of the dim of relevant representations')
+parser.add_argument('--motivator', type=float, default=None,
+                    help='apply a motivator to force the relevant part to encoder features useful for the prediction')
 
 # For surrogate
 parser.add_argument('--surrogate', action='store_true',
@@ -140,10 +144,14 @@ parser.add_argument('--surrogate-disc-w', type=float, default=None,
 parser.add_argument('--random-perturb', action='store_true',
                     help='randomly add perturbations')
 
+parser.add_argument('--surrogate-joint', type=float, default=None, 
+                    help='train the surrogate model jointly with the autoencoder')
 
 # For victim
 parser.add_argument('--victim', action='store_true',
                     help='play with the victim classifier')
+parser.add_argument('--victim-emsize', type=int, default=128,
+                    help='embedding size of the victim classifier')
 parser.add_argument('--victim-load', type=str, default='victim1')
 parser.add_argument('--lr_victim', type=float, default=1e-04,
                     help='victim classifier learning rate')
@@ -231,12 +239,96 @@ def clean_tokens(token_list):
         out.append(t)
     return out
 
+
+def play_with_classifier(victim_classifier, optimizer, whichclass, batch, train=True):
+    if train:
+        victim_classifier.train()
+        victim_classifier.zero_grad()
+    else:
+        victim_classifier.eval()
+
+    source, target, lengths = batch
+    source = to_gpu(args.cuda, Variable(source))
+    labels = to_gpu(args.cuda, Variable(torch.zeros(source.size(0)).fill_(whichclass-1)))
+
+    # Train
+    scores = victim_classifier(source).squeeze(1)
+    classify_loss = F.binary_cross_entropy(scores, labels)
+    if train:
+        classify_loss.backward()
+        optimizer.step()
+    classify_loss = classify_loss.cpu().item()
+
+    pred = scores.data.round()
+    accuracy = pred.eq(labels.data).float().mean()
+
+    return classify_loss, accuracy
+
+def evaluate_classifier(victim_classifier, optimizer):
+    victim_classifier.eval()
+
+    niter = 0
+    tot_classify_loss = 0.0
+    tot_classify_acc = 0.0
+    while niter < len(test1_data) and niter < len(test2_data):
+        classify_loss1, classify_acc1 = play_with_classifier(victim_classifier, optimizer, 1, test1_data[niter], train=False)
+        classify_loss2, classify_acc2 = play_with_classifier(victim_classifier, optimizer, 2, test2_data[niter], train=False)
+        classify_loss = (classify_loss1 + classify_loss2) / 2
+        classify_acc = (classify_acc1 + classify_acc2) / 2
+
+        tot_classify_loss += classify_loss
+        tot_classify_acc += classify_acc
+
+        niter += 1
+
+    return tot_classify_loss / min(len(test1_data), len(test2_data)), tot_classify_acc / min(len(test1_data), len(test2_data))
+
+
+def play_with_surrogate(surrogate, victim, optimizer, batch, code=None, train=True):
+    victim.eval()
+    if train:
+        surrogate.train()
+        surrogate.zero_grad()
+        optimizer.zero_grad()
+    else:
+        surrogate.eval()
+
+    source, target, lengths = batch
+    source = to_gpu(args.cuda, Variable(source))
+
+    out_gold = victim(source).detach()
+    if code is None:
+        code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
+# (nbatch, nhidden)
+    out_surrogate = surrogate(code)
+    
+    loss = F.binary_cross_entropy(out_surrogate, out_gold)
+    if train:
+        loss.backward()
+        optimizer.step()
+
+    return loss.item()
+
+def evaluate_surrogate(surrogate, victim):
+    niter = 0
+    tot_loss = 0.0
+    cnt = 0
+    while niter < len(test1_data) and niter < len(test2_data):
+        cnt += 1
+        loss1 = play_with_surrogate(surrogate, victim, None, test1_data[niter], train=False)
+        loss2 = play_with_surrogate(surrogate, victim, None, test2_data[niter], train=False)
+        loss = (loss1 + loss2) / 2
+
+        tot_loss += loss
+        niter += 1
+    return tot_loss / cnt
+
 if args.victim:
     victim_outf = args.outf + '/victim'
     os.makedirs(victim_outf, exist_ok=True)
 
     ntokens = len(corpus.dictionary.word2idx)
-    victim_classifier = EmbeddingClassifier(args.emsize, ntokens, 1)
+    victim_classifier = EmbeddingClassifier(args.victim_emsize, ntokens, 1)
     print(victim_classifier)
     
     criterion_ce = nn.CrossEntropyLoss()
@@ -249,49 +341,6 @@ if args.victim:
         victim_classifier = victim_classifier.cuda()
         criterion_ce = criterion_ce.cuda()
 
-    def play_with_classifier(whichclass, batch, train=True):
-        if train:
-            victim_classifier.train()
-            victim_classifier.zero_grad()
-        else:
-            victim_classifier.eval()
-
-        source, target, lengths = batch
-        source = to_gpu(args.cuda, Variable(source))
-        labels = to_gpu(args.cuda, Variable(torch.zeros(source.size(0)).fill_(whichclass-1)))
-
-        # Train
-        scores = victim_classifier(source).squeeze(1)
-        classify_loss = F.binary_cross_entropy(scores, labels)
-        if train:
-            classify_loss.backward()
-            optimizer.step()
-        classify_loss = classify_loss.cpu().item()
-
-        pred = scores.data.round()
-        accuracy = pred.eq(labels.data).float().mean()
-
-        return classify_loss, accuracy
-
-    def evaluate_classifier():
-        victim_classifier.eval()
-
-        niter = 0
-        tot_classify_loss = 0.0
-        tot_classify_acc = 0.0
-        while niter < len(test1_data) and niter < len(test2_data):
-            classify_loss1, classify_acc1 = play_with_classifier(1, test1_data[niter], train=False)
-            classify_loss2, classify_acc2 = play_with_classifier(2, test2_data[niter], train=False)
-            classify_loss = (classify_loss1 + classify_loss2) / 2
-            classify_acc = (classify_acc1 + classify_acc2) / 2
-
-            tot_classify_loss += classify_loss
-            tot_classify_acc += classify_acc
-
-            niter += 1
-
-        return tot_classify_loss / min(len(test1_data), len(test2_data)), tot_classify_acc / min(len(test1_data), len(test2_data))
-
     for epoch in range(1, args.epochs+1):
         print('============= Epoch %d ==============' % epoch)
         niter = 0
@@ -299,8 +348,8 @@ if args.victim:
         tot_classify_acc = 0.0
         while niter < len(train1_data) and niter < len(train2_data):
             # train classifier ----------------------------
-            classify_loss1, classify_acc1 = play_with_classifier(1, train1_data[niter])
-            classify_loss2, classify_acc2 = play_with_classifier(2, train2_data[niter])
+            classify_loss1, classify_acc1 = play_with_classifier(victim_classifier, optimizer, 1, train1_data[niter])
+            classify_loss2, classify_acc2 = play_with_classifier(victim_classifier, optimizer, 2, train2_data[niter])
             classify_loss = (classify_loss1 + classify_loss2) / 2
             classify_acc = (classify_acc1 + classify_acc2) / 2
 
@@ -314,7 +363,7 @@ if args.victim:
                 tot_classify_loss = 0.0
                 tot_classify_acc = 0.0
 
-        test_loss, test_acc = evaluate_classifier()
+        test_loss, test_acc = evaluate_classifier(victim_classifier, optimizer)
         print('Epoch %d, loss = %.5f, acc = %.5f' % (epoch, test_loss, test_acc))
         
         with open('{}/victim/victim{}.pt'.format(args.outf, epoch), 'wb') as f:
@@ -351,6 +400,32 @@ else:
     gan_gen = MLP_G(ninput=args.z_size, noutput=args.nhidden, layers=args.arch_g)
     gan_disc = MLP_D(ninput=args.nhidden, noutput=1, layers=args.arch_d)
     classifier = MLP_Classify(ninput=nhidden_irr, noutput=1, layers=args.arch_classify)
+    
+    if not args.surrogate and not args.surrogate_perturb:
+        if args.motivator is not None:
+            motivator = MLP_Classify(ninput=nhidden_rel, noutput=1, layers=args.arch_classify)
+            if args.cuda:
+                motivator = motivator.cuda()
+            optimizer_motivator = optim.Adam(motivator.parameters(),
+                        lr=args.lr_classify,
+                        betas=(args.beta1, 0.999))
+            
+        if args.surrogate_joint is not None:
+            surrogate = MLP_Classify(args.nhidden, 1, args.surrogate_layers, gpu=args.cuda) 
+            victim_classifier = EmbeddingClassifier(args.victim_emsize, ntokens, 1)
+            os.makedirs('{}/surrogate'.format(args.outf), exist_ok=True)
+
+            surrogate_optimizer = optim.Adam(surrogate.parameters(),
+                    lr=args.lr_surrogate,
+                    betas=(args.beta1, 0.999))
+
+            with open('{}/victim/{}.pt'.format(args.outf, args.victim_load), 'rb') as f:
+                victim_classifier.load_state_dict(torch.load(f))
+
+            if args.cuda:
+                surrogate = surrogate.cuda()
+                victim_classifier = victim_classifier.cuda()
+
     g_factor = None
 
     print(autoencoder)
@@ -391,9 +466,12 @@ else:
             torch.save(gan_gen.state_dict(), f)
         with open('{}/gan_disc_model{}.pt'.format(args.outf, suffix), 'wb') as f:
             torch.save(gan_disc.state_dict(), f)
+        if args.surrogate_joint:
+            with open('{}/surrogate/surrogate{}.pt'.format(args.outf, suffix), 'wb') as f:
+                torch.save(surrogate.state_dict(), f)
 
 
-    def train_classifier(whichclass, batch):
+    def train_classifier(classifier, optimizer_classify, rel, whichclass, batch):
         classifier.train()
         classifier.zero_grad()
 
@@ -403,7 +481,7 @@ else:
 
         # Train
         code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
-        scores = classifier(code[:,:nhidden_irr])
+        scores = classifier(code[:,nhidden_irr:]) if rel else classifier(code[:,:nhidden_irr]) 
         classify_loss = F.binary_cross_entropy(scores.squeeze(1), labels)
         classify_loss.backward()
         optimizer_classify.step()
@@ -434,6 +512,19 @@ else:
         code.register_hook(grad_hook_cla)
         scores = classifier(code[:,:nhidden_irr])
         classify_reg_loss = F.binary_cross_entropy(scores.squeeze(1), labels)
+        
+        if args.motivator is not None:
+            motivator_scores = motivator(code[:, nhidden_irr:])
+            motivator_reg_loss = F.binary_cross_entropy(motivator_scores.squeeze(1), labels)
+            classify_reg_loss = classify_reg_loss - args.motivator * motivator_reg_loss
+
+        if args.surrogate_joint is not None:
+            out_gold = victim_classifier(source).detach()
+            out_surrogate = surrogate(code)
+            
+            surrogate_reg_loss = F.binary_cross_entropy(out_surrogate, out_gold)
+            classify_reg_loss = classify_reg_loss - args.surrogate_joint * surrogate_reg_loss
+
         classify_reg_loss.backward()
 
         torch.nn.utils.clip_grad_norm(autoencoder.parameters(), args.clip)
@@ -683,7 +774,7 @@ else:
 
     if args.surrogate or args.surrogate_perturb:
         surrogate = MLP_Classify(args.nhidden, 1, args.surrogate_layers, gpu=args.cuda) 
-        victim_classifier = EmbeddingClassifier(args.emsize, ntokens, 1)
+        victim_classifier = EmbeddingClassifier(args.victim_emsize, ntokens, 1)
 
         if args.cuda:
             surrogate = surrogate.cuda()
@@ -691,11 +782,11 @@ else:
 
 # load the autoencoder
         print('Loading models ...')
-        with open('{}/autoencoder_model.pt'.format(args.outf), 'rb') as f:
+        with open('{}/autoencoder_model{}.pt'.format(args.outf, args.load_suffix), 'rb') as f:
             autoencoder.load_state_dict(torch.load(f))
-        with open('{}/gan_gen_model.pt'.format(args.outf), 'rb') as f:
+        with open('{}/gan_gen_model{}.pt'.format(args.outf, args.load_suffix), 'rb') as f:
             gan_gen.load_state_dict(torch.load(f))
-        with open('{}/gan_disc_model.pt'.format(args.outf), 'rb') as f:
+        with open('{}/gan_disc_model{}.pt'.format(args.outf, args.load_suffix), 'rb') as f:
             gan_disc.load_state_dict(torch.load(f))
 # load the victim
         with open('{}/victim/{}.pt'.format(args.outf, args.victim_load), 'rb') as f:
@@ -706,44 +797,6 @@ else:
             surrogate_optimizer = optim.Adam(surrogate.parameters(),
                     lr=args.lr_surrogate,
                     betas=(args.beta1, 0.999))
-            def play_with_surrogate(batch, code=None, train=True):
-                victim_classifier.eval()
-                if train:
-                    surrogate.train()
-                    surrogate.zero_grad()
-                else:
-                    surrogate.eval()
-
-                source, target, lengths = batch
-                source = to_gpu(args.cuda, Variable(source))
-
-                out_gold = victim_classifier(source).detach()
-                if code is None:
-                    code = autoencoder(0, source, lengths, noise=False, encode_only=True).detach()
-# (nbatch, nhidden)
-                out_surrogate = surrogate(code)
-                
-                loss = F.binary_cross_entropy(out_surrogate, out_gold)
-                if train:
-                    loss.backward()
-                    surrogate_optimizer.step()
-
-                return loss.item()
-
-            def evaluate_surrogate():
-                niter = 0
-                tot_loss = 0.0
-                cnt = 0
-                while niter < len(test1_data) and niter < len(test2_data):
-                    cnt += 1
-                    loss1 = play_with_surrogate(test1_data[niter], train=False)
-                    loss2 = play_with_surrogate(test2_data[niter], train=False)
-                    loss = (loss1 + loss2) / 2
-
-                    tot_loss += loss
-                    niter += 1
-                return tot_loss / cnt
-
             os.makedirs('{}/surrogate'.format(args.outf), exist_ok=True)
 
             for epoch in range(1, args.epochs + 1):
@@ -751,8 +804,8 @@ else:
                 tot_loss = 0.0
                 tot_sample_loss = 0.0
                 while niter < len(train1_data) and niter < len(train2_data):
-                    loss1 = play_with_surrogate(train1_data[niter])
-                    loss2 = play_with_surrogate(train2_data[niter])
+                    loss1 = play_with_surrogate(surrogate, surrogate_optimizer, train1_data[niter])
+                    loss2 = play_with_surrogate(surrogate, surrogate_optimizer, train2_data[niter])
                     loss = (loss1 + loss2) / 2
 
                     
@@ -774,7 +827,7 @@ else:
                                 sent_idx.append(corpus.dictionary.word2idx['<pad>'])
                         max_indices = torch.tensor(max_indices, dtype=torch.int64)
                         lens = torch.tensor(lens, dtype=torch.int64)
-                        sample_loss = play_with_surrogate((max_indices, None, lens), code=sample_hidden)
+                        sample_loss = play_with_surrogate(surrogate, surrogate_optimizer, (max_indices, None, lens), code=sample_hidden)
                         
                         tot_sample_loss += sample_loss
                          
@@ -791,7 +844,7 @@ else:
                         tot_loss = 0.0
                         tot_sample_loss = 0.0
 
-                test_loss = evaluate_surrogate()
+                test_loss = evaluate_surrogate(surrogate)
                 print('Epoch %d: %.5f' % (epoch, test_loss))
 
                 train1_data = batchify(corpus.data['train1'], args.batch_size, shuffle=True)
@@ -837,6 +890,7 @@ else:
                 
                 return autoencoder.generate(whichclass, perturbed_code, 50).squeeze(0)
 
+
             with open('{}/surrogate/{}.pt'.format(args.outf, args.surrogate_load), 'rb') as f:
                 surrogate.load_state_dict(torch.load(f))
 
@@ -869,11 +923,10 @@ else:
                         print('======================')
             print('Success rate: %.5f%% (%d/%d)' % (success / tot_cnt * 100, success, tot_cnt))
                 
-    else:
+    else: 
         print("Training...")
         with open("{}/log_{}.txt".format(args.outf, suffix_name), 'a') as f:
             f.write('Training...\n')
-
 # schedule of increasing GAN training loops
         if args.niters_gan_schedule != "":
             gan_schedule = [int(x) for x in args.niters_gan_schedule.split("-")]
@@ -917,10 +970,22 @@ else:
                         train_ae(2, train2_data[niter], total_loss_ae2, start_time, niter)
                     
                     # train classifier ----------------------------
-                    classify_loss1, classify_acc1 = train_classifier(1, train1_data[niter])
-                    classify_loss2, classify_acc2 = train_classifier(2, train2_data[niter])
+                    classify_loss1, classify_acc1 = train_classifier(classifier, optimizer_classify, False, 1, train1_data[niter])
+                    classify_loss2, classify_acc2 = train_classifier(classifier, optimizer_classify, False, 2, train2_data[niter])
                     classify_loss = (classify_loss1 + classify_loss2) / 2
                     classify_acc = (classify_acc1 + classify_acc2) / 2
+                    # train motivator ----------------------------
+                    if args.motivator is not None:
+                        motivator_loss1, motivator_acc1 = train_classifier(motivator, optimizer_motivator, True, 1, train1_data[niter])
+                        motivator_loss2, motivator_acc2 = train_classifier(motivator, optimizer_motivator, True, 2, train2_data[niter])
+                        motivator_loss = (motivator_loss1 + motivator_loss2) / 2
+                        motivator_acc = (motivator_acc1 + motivator_acc2) / 2
+                    # jointly train surrogate
+                    if args.surrogate_joint is not None:
+                        surrogate_loss1 = play_with_surrogate(surrogate, victim_classifier, surrogate_optimizer, train1_data[niter], train=True)
+                        surrogate_loss2 = play_with_surrogate(surrogate, victim_classifier, surrogate_optimizer, train2_data[niter], train=True)
+                        surrogate_loss = (surrogate_loss1 + surrogate_loss2) / 2
+                        
                     # reverse to autoencoder
                     classifier_regularize(1, train1_data[niter])
                     classifier_regularize(2, train2_data[niter])
