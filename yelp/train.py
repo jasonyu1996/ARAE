@@ -56,7 +56,7 @@ parser.add_argument('--arch_g', type=str, default='512-512',
                     help='generator architecture (MLP)')
 parser.add_argument('--arch_d', type=str, default='512-512',
                     help='critic/discriminator architecture (MLP)')
-parser.add_argument('--arch_classify', type=str, default='512-512',
+parser.add_argument('--arch_classify', type=str, default='512-256-128',
                     help='classifier architecture')
 parser.add_argument('--z_size', type=int, default=32,
                     help='dimension of random noise z to feed into generator')
@@ -83,11 +83,11 @@ parser.add_argument('--niters_gan_schedule', type=str, default='',
                          ' iterations (increment by 1 each time)')
 parser.add_argument('--lr_ae', type=float, default=1,
                     help='autoencoder learning rate')
-parser.add_argument('--lr_gan_g', type=float, default=1e-04,
+parser.add_argument('--lr_gan_g', type=float, default=5e-05,
                     help='generator learning rate')
-parser.add_argument('--lr_gan_d', type=float, default=1e-04,
+parser.add_argument('--lr_gan_d', type=float, default=1e-05,
                     help='critic/discriminator learning rate')
-parser.add_argument('--lr_classify', type=float, default=1e-04,
+parser.add_argument('--lr_classify', type=float, default=1e-01,
                     help='classifier learning rate')
 parser.add_argument('--beta1', type=float, default=0.5,
                     help='beta1 for adam. default=0.5')
@@ -466,6 +466,8 @@ else:
             torch.save(gan_gen.state_dict(), f)
         with open('{}/gan_disc_model{}.pt'.format(args.outf, suffix), 'wb') as f:
             torch.save(gan_disc.state_dict(), f)
+        with open('{}/adversarial_classifier{}.pt'.format(args.outf, suffix), 'wb') as f:
+            torch.save(classifier.state_dict(), f)
         if args.surrogate_joint:
             with open('{}/surrogate/surrogate{}.pt'.format(args.outf, suffix), 'wb') as f:
                 torch.save(surrogate.state_dict(), f)
@@ -523,7 +525,7 @@ else:
             out_surrogate = surrogate(code)
             
             surrogate_reg_loss = F.binary_cross_entropy(out_surrogate, out_gold)
-            classify_reg_loss = classify_reg_loss - args.surrogate_joint * surrogate_reg_loss
+            classify_reg_loss = classify_reg_loss + args.surrogate_joint * surrogate_reg_loss
 
         classify_reg_loss.backward()
 
@@ -804,8 +806,8 @@ else:
                 tot_loss = 0.0
                 tot_sample_loss = 0.0
                 while niter < len(train1_data) and niter < len(train2_data):
-                    loss1 = play_with_surrogate(surrogate, surrogate_optimizer, train1_data[niter])
-                    loss2 = play_with_surrogate(surrogate, surrogate_optimizer, train2_data[niter])
+                    loss1 = play_with_surrogate(surrogate, victim_classifier, surrogate_optimizer, train1_data[niter])
+                    loss2 = play_with_surrogate(surrogate, victim_classifier, surrogate_optimizer, train2_data[niter])
                     loss = (loss1 + loss2) / 2
 
                     
@@ -827,7 +829,7 @@ else:
                                 sent_idx.append(corpus.dictionary.word2idx['<pad>'])
                         max_indices = torch.tensor(max_indices, dtype=torch.int64)
                         lens = torch.tensor(lens, dtype=torch.int64)
-                        sample_loss = play_with_surrogate(surrogate, surrogate_optimizer, (max_indices, None, lens), code=sample_hidden)
+                        sample_loss = play_with_surrogate(surrogate, victim_classifier, surrogate_optimizer, (max_indices, None, lens), code=sample_hidden)
                         
                         tot_sample_loss += sample_loss
                          
@@ -844,7 +846,7 @@ else:
                         tot_loss = 0.0
                         tot_sample_loss = 0.0
 
-                test_loss = evaluate_surrogate(surrogate)
+                test_loss = evaluate_surrogate(surrogate, victim_classifier)
                 print('Epoch %d: %.5f' % (epoch, test_loss))
 
                 train1_data = batchify(corpus.data['train1'], args.batch_size, shuffle=True)
